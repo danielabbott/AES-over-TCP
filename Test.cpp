@@ -19,6 +19,11 @@ int main() {
 		auto [received_data, received_data_size] = tcp.read_message();
 		received_data.get()[received_data_size-1] = 0;
 		cout << "Client received: " << received_data.get() << '\n';
+
+		char send_data2[] = {'A', 0};
+		tcp.send_message(ArrayPointer<unsigned char>(
+			reinterpret_cast<unsigned char *>(send_data2), sizeof send_data2
+		));
 	}
 	catch(exception const& e) {
 		cout << e.what() << '\n';
@@ -28,13 +33,15 @@ int main() {
 		TCPClient c = s.listen(key);
 		cout << "Server got connection\n";
 
-		auto [received_data, received_data_size] = c.read_message();
-		received_data.get()[received_data_size-1] = 0;
-		cout << "Server received: " << received_data.get() << '\n';
-		char send_data[] = {'b','y','e',0};
-		c.send_message(ArrayPointer<unsigned char>(
-			reinterpret_cast<unsigned char *>(send_data), sizeof send_data
-		));
+		while(1) {
+			auto [received_data, received_data_size] = c.read_message();
+			received_data.get()[received_data_size-1] = 0;
+			cout << "Server received: " << received_data.get() << '\n';
+			char send_data[] = {'b','y','e',0};
+			c.send_message(ArrayPointer<unsigned char>(
+				reinterpret_cast<unsigned char *>(send_data), sizeof send_data
+			));
+		}
 	}
 	return 0;
 }

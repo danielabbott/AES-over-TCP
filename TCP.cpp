@@ -12,34 +12,9 @@
 
 using namespace std;
 
-void TCPClient::create_ssl_objects() {
-	EVP_CIPHER_CTX * ctx_enc = EVP_CIPHER_CTX_new();
-	EVP_CIPHER_CTX * ctx_dec = EVP_CIPHER_CTX_new();
-	if(!ctx_enc || !ctx_dec) {
-		throw runtime_error("Error creating encryption/decryption objects");
-	}
-
-	if(EVP_DecryptInit_ex(ctx_dec, EVP_aes_128_cbc(), NULL, key.data(), iv.data()) != 1) {
-       	throw runtime_error("EVP_DecryptInit_ex error");
-	}
-
-	if(EVP_EncryptInit_ex(ctx_enc, EVP_aes_128_cbc(), NULL, key.data(), iv.data()) != 1) {
-       	throw runtime_error("EVP_EncryptInit_ex error");
-	}
-
-	encryption_context = reinterpret_cast<uintptr_t>(ctx_enc);
-	decryption_context = reinterpret_cast<uintptr_t>(ctx_dec);
-}
 
 TCPClient::TCPClient(int handle, array<unsigned char, 16> key_) 
 : socket_handle(handle), key(key_) {
-	// Receive IV
-
-	if(recv(socket_handle, iv.data(), 16, 0) != 16)
-	{
-		throw exception();
-	}
-	create_ssl_objects();
 }
 
 TCPClient::TCPClient(string const& ip, bool ipv6, unsigned short port, array<unsigned char, 16> key_)
@@ -74,18 +49,6 @@ TCPClient::TCPClient(string const& ip, bool ipv6, unsigned short port, array<uns
 			throw runtime_error("Error connecting IPv4 client socket");
 		}
 	}
-
-	// Generate and send IV
-
-	try_create_random(ArrayPointer<uint8_t>(iv.data(), 16));
-
-
-	if(send(socket_handle, iv.data(), 16, 0) != 16)
-	{
-		throw runtime_error("Error sending IV data");
-	}
-
-	create_ssl_objects();
 }
 
 TCPClient::TCPClient(TCPClient&& other)
@@ -102,12 +65,46 @@ TCPClient& TCPClient::operator=(TCPClient&& other)
 }
 
 pair<HeapArray<unsigned char>, uint32_t> TCPClient::read_message() {
-	#define ERR(x) { \
-		socket_handle = -1; \
-		throw runtime_error(x); }
+	EVP_CIPHER_CTX * ctx = nullptr;
+
+	const auto ERR = [ctx, this](const char * x) {
+		if(socket_handle >= 0) { 
+			close(socket_handle);
+			socket_handle = -1;
+		}
+		if(ctx) {
+			EVP_CIPHER_CTX_free(ctx);
+		}
+		throw runtime_error(x);
+	};
 
 	if(socket_handle < 0) {
 		ERR("Socket closed");
+	}
+
+    array<uint8_t, 16> iv;
+    if(recv(socket_handle, iv.data(), 16, 0) != 16)
+	{
+		ERR("Error receiving TCP data");
+	}
+
+    array<uint8_t, 16> tag;
+    if(recv(socket_handle, tag.data(), 16, 0) != 16)
+	{
+		ERR("Error receiving TCP data");
+	}
+
+	ctx = EVP_CIPHER_CTX_new();
+	if(!ctx) {
+		ERR("EVP_CIPHER_CTX_new error");
+	}
+
+	if(EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, key.data(), iv.data()) != 1) {
+       	ERR("EVP_DecryptInit_ex error");
+	}
+
+	if(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 16, NULL) != 1) {
+        ERR("EVP_CIPHER_CTX_ctrl error");
 	}
 
 	uint32_t decrypted_message_length;
@@ -122,7 +119,7 @@ pair<HeapArray<unsigned char>, uint32_t> TCPClient::read_message() {
 		ERR("Error receiving TCP data");
 	}
 
-	if(decrypted_message_length < 4 || encrypted_message_length < 4)
+	if(decrypted_message_length < 1 || encrypted_message_length < 1)
 	{
 		ERR("Invalid message length");
 	}
@@ -136,18 +133,20 @@ pair<HeapArray<unsigned char>, uint32_t> TCPClient::read_message() {
 
 	HeapArray<unsigned char> decrypted(encrypted_data.size()+16);
 
-	auto ctx = reinterpret_cast<EVP_CIPHER_CTX *>(decryption_context);
-
 	int actual_decrypted_length;
 	if(EVP_DecryptUpdate(ctx, decrypted.data(), &actual_decrypted_length,
 			encrypted_data.data(), encrypted_data.size()) != 1) {
 		ERR("EVP_DecryptUpdate error");
 	}
 
+	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, tag.data());
+
 	int extra;
 	if(EVP_DecryptFinal_ex(ctx, &decrypted.data()[actual_decrypted_length], &extra) != 1) {
 		ERR("EVP_DecryptFinal_ex error");
 	}
+	   
+	EVP_CIPHER_CTX_free(ctx);
 
 
 	return make_pair(move(decrypted), decrypted_message_length);
@@ -155,13 +154,45 @@ pair<HeapArray<unsigned char>, uint32_t> TCPClient::read_message() {
 
 void TCPClient::send_message(ArrayPointer<unsigned char> const& data)
 {
+	EVP_CIPHER_CTX * ctx = nullptr;
+
+	const auto ERR = [ctx, this](const char * x) {
+		if(socket_handle >= 0) { 
+			close(socket_handle);
+			socket_handle = -1;
+		}
+		if(ctx) {
+			EVP_CIPHER_CTX_free(ctx);
+		}
+		throw runtime_error(x);
+	};
+
 	if(socket_handle < 0) {
 		ERR("Socket closed");
 	}
 
-	HeapArray<unsigned char> encrypted(data.size() + 15);
+	array<uint8_t, 16> iv;	
+	try_create_random(ArrayPointer<uint8_t>(iv.data(), 16));
+	if(send(socket_handle, iv.data(), 16, 0) != 16)
+	{
+		ERR("TCP send error");
+	}
 
-	auto ctx = reinterpret_cast<EVP_CIPHER_CTX *>(encryption_context);
+
+	ctx = EVP_CIPHER_CTX_new();
+	if(!ctx) {
+		throw runtime_error("EVP_CIPHER_CTX_new error");
+	}
+
+	if(EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, key.data(), iv.data()) != 1) {
+       	throw runtime_error("EVP_EncryptInit_ex error");
+	}
+
+	if(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 16, NULL) != 1) {
+        throw runtime_error("EVP_CIPHER_CTX_ctrl error");
+	}
+
+	HeapArray<unsigned char> encrypted(data.size() + 15);
 
     int encrypted_data_length;
    	if(EVP_EncryptUpdate(ctx, encrypted.data(), &encrypted_data_length, data.data(), data.size()) != 1) {
@@ -178,6 +209,13 @@ void TCPClient::send_message(ArrayPointer<unsigned char> const& data)
     	ERR("");
     }
 
+    array<uint8_t, 16> tag;
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag.data());
+
+    if(send(socket_handle, tag.data(), 16, 0) != 16)
+	{
+		ERR("TCP send error");
+	}
 
     // Send encrypted data
 
@@ -197,17 +235,16 @@ void TCPClient::send_message(ArrayPointer<unsigned char> const& data)
 		ERR("TCP send error");
 	}
 
+	EVP_CIPHER_CTX_free(ctx);
+
 }
 
 
 TCPClient::~TCPClient()
 {
-	close(socket_handle);
-	if(encryption_context) {
-	    EVP_CIPHER_CTX_free(reinterpret_cast<EVP_CIPHER_CTX *>(encryption_context));
-	}
-	if(decryption_context) {
-	    EVP_CIPHER_CTX_free(reinterpret_cast<EVP_CIPHER_CTX *>(decryption_context));
+	if(socket_handle >= 0) {
+		close(socket_handle);
+		socket_handle = -1;
 	}
 }
 

@@ -1,6 +1,6 @@
 #pragma once
 
-/* AES-128-CBC encrypted TCP client and server */
+/* AES-128-GCM encrypted TCP client and server */
 
 #include <vector>
 #include <functional>
@@ -16,12 +16,7 @@ class TCPClient {
 	friend TCPServer;
 	TCPClient(int handle, std::array<unsigned char, 16> key);
 	int socket_handle = -1;
-	std::array<unsigned char, 16> iv;
 	std::array<unsigned char, 16> key;
-
-	uintptr_t encryption_context=0, decryption_context=0;
-
-	void create_ssl_objects();
 
 public:
 	// ipv6 must be true if the ip string represents an ipv6 address
